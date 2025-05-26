@@ -41,6 +41,7 @@ def fused_chunk_linear_attn_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
     CHECK: tl.constexpr
@@ -50,8 +51,10 @@ def fused_chunk_linear_attn_fwd_kernel(
 
     o_i = tl.arange(0, BT)
 
-    # [BT, BT]
-    m_s = o_i[:, None] >= o_i[None, :]
+    # Create blockwise causal mask.
+    block_indices = o_i // BLOCK_SIZE
+    m_s = block_indices[:, None] <= block_indices[None, :]
+    
     # [BK, BV]
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
 
@@ -89,7 +92,6 @@ def fused_chunk_linear_attn_fwd_kernel(
         p_ht = tl.make_block_ptr(ht + i_bh * K*V, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
         tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
-
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
 })
@@ -120,6 +122,7 @@ def fused_chunk_linear_attn_bwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     CHECK: tl.constexpr
 ):
@@ -127,7 +130,10 @@ def fused_chunk_linear_attn_bwd_kernel(
     i_b, i_h = i_bh // H, i_bh % H
     o_i = tl.arange(0, BT)
 
-    m_s = o_i[:, None] >= o_i[None, :]
+    # create causal mask
+    block_indices = o_i // BLOCK_SIZE
+    m_s = block_indices[:, None] <= block_indices[None, :]
+    
     # [BV, BK]
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -167,7 +173,7 @@ def fused_chunk_linear_attn_bwd_kernel(
     tl.debug_barrier()
     # [BK, BV]
     b_dh = tl.zeros([BK, BV], dtype=tl.float32)
-    m_s = o_i[:, None] <= o_i[None, :]
+    m_s = block_indices[:, None] >= block_indices[None, :]
     for i_t in range(1, tl.cdiv(T, BT) + 1):
         p_q = tl.make_block_ptr(q + (i_b * T*H + i_h) * K, (K, T), (1, H*K), (i_k * BK, T - i_t * BT), (BK, BT), (0, 1))
         p_k = tl.make_block_ptr(k + (i_b * T*H + i_h) * K, (T, K), (H*K, 1), (T - i_t * BT, i_k * BK), (BT, BK), (1, 0))
@@ -206,13 +212,11 @@ def fused_chunk_linear_attn_bwd_kernel(
         tl.store(p_dk, b_dk.to(p_dk.dtype.element_ty), boundary_check=(0, 1))
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
-
 class FusedChunkLinearAttentionFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, scale, initial_state, output_final_state):
+    def forward(ctx, q, k, v, scale, initial_state, output_final_state, block_size):
         B, T, H, K, V = *k.shape, v.shape[-1]
         BT = min(64, max(16, triton.next_power_of_2(T)))
         BK, BV = min(triton.next_power_of_2(K), 64), min(triton.next_power_of_2(V), 64)
@@ -220,8 +224,6 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
 
         o = q.new_empty(NK, *v.shape)
         final_state = q.new_empty(B, H, K, V, dtype=torch.float) if output_final_state else None
-        # the bug still exists even for Triton 2.2 on H100 GPUs
-        # so we always enable initial checks
         CHECK = True
         if version.parse(triton.__version__) < version.parse('2.2.0'):
             import warnings
@@ -251,6 +253,7 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
             BT=BT,
             BK=BK,
             BV=BV,
+            BLOCK_SIZE=block_size,
             CHECK=CHECK
         )
         o = o.sum(0) if NK > 1 else o[0]
@@ -258,6 +261,7 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, initial_state)
         ctx.scale = scale
         ctx.CHECK = CHECK
+        ctx.block_size = block_size
         return o.to(q.dtype), final_state
 
     @staticmethod
@@ -267,6 +271,7 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
         q, k, v, initial_state = ctx.saved_tensors
         B, T, H, K, V = *k.shape, v.shape[-1]
         scale = ctx.scale
+        block_size = ctx.block_size
 
         BT = min(64, max(16, triton.next_power_of_2(T)))
         BK, BV = min(triton.next_power_of_2(K), 64), min(triton.next_power_of_2(V), 64)
@@ -295,13 +300,13 @@ class FusedChunkLinearAttentionFunction(torch.autograd.Function):
             BT=BT,
             BK=BK,
             BV=BV,
+            BLOCK_SIZE=block_size,
             CHECK=ctx.CHECK
         )
         dq = dq.sum(0)
         dk = dk.sum(0)
         dv = dv.sum(0)
-        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None
-
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None
 
 def fused_chunk_linear_attn(
     q: torch.Tensor,
@@ -311,7 +316,8 @@ def fused_chunk_linear_attn(
     initial_state: torch.Tensor = None,
     output_final_state: bool = False,
     normalize: bool = True,
-    head_first: bool = False
+    head_first: bool = False,
+    block_size: int = 16
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -332,6 +338,9 @@ def fused_chunk_linear_attn(
             Whether to normalize the output. Default: `True`.
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format. Default: `False`.
+        block_size (int):
+            Size of blocks for block-wise causal masking. Within each block,
+            attention is bidirectional. Default: `16`.
 
     Returns:
         o (torch.Tensor):
@@ -355,7 +364,7 @@ def fused_chunk_linear_attn(
                 "when head_first=False was specified. "
                 "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
             )
-    o, final_state = FusedChunkLinearAttentionFunction.apply(q, k, v, scale, initial_state, output_final_state)
+    o, final_state = FusedChunkLinearAttentionFunction.apply(q, k, v, scale, initial_state, output_final_state, block_size)
     if normalize:
         o = normalize_output(q * scale, k, o)
     if head_first:
